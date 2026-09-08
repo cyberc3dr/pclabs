@@ -1,0 +1,2 @@
+[plugins]
+shadow = "com.gradleup.shadow:9.6.1"
