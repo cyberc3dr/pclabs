@@ -4,8 +4,10 @@ plugins {
     alias(libs.plugins.shadow)
 }
 
-application {
-    mainClass = "ru.cyberc3dr.pc.Main"
+tasks.register<JavaExec>("runTask1") {
+    group = "application"
+    mainClass.set("ru.cyberc3dr.pc.Task1")
+    classpath = sourceSets["main"].runtimeClasspath
 }
 
 group = "ru.cyberc3dr"
@@ -27,9 +29,6 @@ tasks.withType<JavaCompile> {
 tasks.withType<Jar> {
     destinationDirectory = file("$rootDir/build")
     archiveVersion = ""
-    manifest {
-        attributes["Main-Class"] = application.mainClass
-    }
 }
 
 sourceSets.main {
