@@ -61,14 +61,22 @@ public class DoubleCheckedLockingExercise {
     }
 
     private static final class LazyResource {
+        private boolean isInitialized = false;
+
         private final Object monitor = new Object();
 
         // TODO: при необходимости измените объявление поля.
         private ExpensiveResource instance;
 
         ExpensiveResource getInstance() {
-            // TODO: реализуйте корректный Double-Checked Locking.
-            throw new UnsupportedOperationException("getInstance is not implemented");
+            if(!isInitialized) {
+                synchronized (this) {
+                    if(instance == null)
+                        instance = new ExpensiveResource();
+                    isInitialized = true;
+                }
+            }
+            return instance;
         }
     }
 
