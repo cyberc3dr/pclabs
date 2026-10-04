@@ -456,9 +456,27 @@ class P1DiningPhilosophersHomework {
             Fork left = forks[philosopherId];
             Fork right = forks[(philosopherId + 1) % forks.length];
 
-            // TODO: захватите обе вилки в порядке id, вызовите
-            // eatWithBothForks(left, right) и гарантированно освободите вилки.
-            throw new UnsupportedOperationException("eat is not implemented");
+            // ну по инструкции вилки по айдишнику захватываются
+
+            // Определяем порядок захвата.
+            // ID влияют - первой захватывается меньшая вилка, потом большая
+            Fork first = left.id < right.id ? left : right;
+            Fork second = left.id < right.id ? right : left;
+
+            // В порядке возрастания id
+            first.lock.lock();
+            try {
+                second.lock.lock();
+                try {
+                    eatWithBothForks(left, right);
+                } finally {
+                    // В начале освобождается вторая
+                    second.lock.unlock();
+                }
+            } finally {
+                // Потом первая
+                first.lock.unlock();
+            }
         }
 
         private void eatWithBothForks(Fork left, Fork right) {
