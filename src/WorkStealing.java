@@ -2,11 +2,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
 import java.util.Vector;
-import java.util.concurrent.BlockingDeque;
-import java.util.concurrent.Executor;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.stream.IntStream;
@@ -24,6 +20,36 @@ public class WorkStealing {
     }
 
     public interface ShutdownableExecutor extends Shutdownable, Executor{}
+
+    // По заданию
+    static class FixedThreadPoolExecutor implements ShutdownableExecutor {
+
+        private final ExecutorService executor;
+
+        public FixedThreadPoolExecutor(int nThreads) {
+            executor = Executors.newFixedThreadPool(nThreads);
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            executor.submit(command);
+        }
+
+        @Override
+        public void shutdown() {
+            executor.shutdown();
+            // надо бы его убить
+            try {
+                if (!executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)) {
+                    throw new RuntimeException("FixedThreadPool did not terminate");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
     static class ThreadPerTaskExecutor implements ShutdownableExecutor{
         List<Thread> threads = new ArrayList<>();
         @Override
@@ -267,6 +293,11 @@ public class WorkStealing {
 
         for (var distribution : TaskDistribution.values()) {
             System.out.println("Task distribution: " + distribution);
+
+            var fixedThreadPoolResult = measureExecutor(new FixedThreadPoolExecutor(THREAD_NUMBER), distribution);
+
+            System.out.println("Fixed Thread Pool submition time: " + fixedThreadPoolResult.first/1_000_000d);
+            System.out.println("Fixed Thread Pool execution time: " + fixedThreadPoolResult.second/1_000_000d);
 
             var roundRobinExecutorResult = measureExecutor(new RoundRobinExecutor(THREAD_NUMBER), distribution);
 
