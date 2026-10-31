@@ -7,6 +7,14 @@ import java.nio.file.Path;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.Random;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /*
  * ПРАКТИЧЕСКОЕ ЗАДАНИЕ: МНОГОПОТОЧНЫЙ АНАЛИЗ ЛОГОВ ВЕБ-СЕРВЕРА
@@ -169,6 +177,80 @@ public class LogAnalysisAssignment {
             long responseBytes,
             long maxDurationMillis
     ) {}
+
+    /** Потокобезопасный аккумулятор статистики. globalLock — одна блокировка на все URL. */
+    public static final class Statistics {
+        private final ConcurrentHashMap<String, UrlStats> byUrl = new ConcurrentHashMap<>();
+        private final Object globalMonitor = new Object();
+        private final boolean globalLock;
+        private final AtomicInteger filesProcessed = new AtomicInteger();
+        private final AtomicInteger linesRead = new AtomicInteger();
+        private final AtomicInteger validRecords = new AtomicInteger();
+        private final AtomicInteger corruptedRecords = new AtomicInteger();
+        private final AtomicInteger readErrors = new AtomicInteger();
+        private final AtomicInteger activeFiles = new AtomicInteger();
+        private final AtomicInteger maxActiveFiles = new AtomicInteger();
+        private volatile boolean stopped;
+
+        public Statistics() { this(false); }
+        public Statistics(boolean globalLock) { this.globalLock = globalLock; }
+
+        public void stop() { stopped = true; }
+        public boolean stopped() { return stopped; }
+
+        public void merge(LogEntry entry) {
+            if (stopped) return;
+            UrlStats stats = byUrl.computeIfAbsent(entry.path(), k -> new UrlStats());
+            Object lock = globalLock ? globalMonitor : stats;
+            synchronized (lock) {
+                stats.requests++;
+                if (entry.status() >= 200 && entry.status() <= 399) stats.successful++;
+                else stats.errors++;
+                stats.responseBytes += entry.responseBytes();
+                stats.totalDuration += entry.durationMillis();
+                if (entry.durationMillis() > stats.maxDuration) stats.maxDuration = entry.durationMillis();
+            }
+            validRecords.incrementAndGet();
+        }
+
+        public void fileDone() { filesProcessed.incrementAndGet(); }
+        public void fileError() { readErrors.incrementAndGet(); }
+        public void lineRead() { linesRead.incrementAndGet(); }
+        public void corrupted() { corruptedRecords.incrementAndGet(); }
+
+        public void acquireActive() {
+            activeFiles.incrementAndGet();
+            updateMaxActive();
+        }
+        public void releaseActive() { activeFiles.decrementAndGet(); }
+
+        private void updateMaxActive() {
+            for (;;) {
+                int current = maxActiveFiles.get();
+                int now = activeFiles.get();
+                if (now <= current || maxActiveFiles.compareAndSet(current, now)) return;
+            }
+        }
+
+        public Report buildReport() {
+            long requests = 0, successful = 0, errors = 0, bytes = 0, maxDuration = 0;
+            for (UrlStats stats : byUrl.values()) {
+                Object lock = globalLock ? globalMonitor : stats;
+                synchronized (lock) {
+                    requests += stats.requests;
+                    successful += stats.successful;
+                    errors += stats.errors;
+                    bytes += stats.responseBytes;
+                    if (stats.maxDuration > maxDuration) maxDuration = stats.maxDuration;
+                }
+            }
+            return new Report(requests, successful, errors, bytes, maxDuration);
+        }
+
+        private static final class UrlStats {
+            long requests, successful, errors, responseBytes, totalDuration, maxDuration;
+        }
+    }
 
     /**
      * Возвращает отдельный итератор для чтения строк одного файла.
@@ -384,6 +466,12 @@ public class LogAnalysisAssignment {
             return;
         }
 
+        // расширяемость конечно кал, но в целом под практику сойдёт
+        if (args.length > 0 && args[0].equals("analyze")) {
+            analyze(args);
+            return;
+        }
+
         System.out.println(
                 "Usage: java LogAnalysisAssignment "
                         + "generate <directory> <files> <lines>"
@@ -391,5 +479,165 @@ public class LogAnalysisAssignment {
         System.out.println(
                 "       java LogAnalysisAssignment check"
         );
+        System.out.println(
+                "       java LogAnalysisAssignment analyze <directory> [workers] [semaphoreLimit] [global|perUrl]"
+        );
+    }
+
+    private static void analyze(String[] args) throws Exception {
+        Path directory = Path.of(args.length > 1 ? args[1] : "logs");
+        int workers = args.length > 2 ? Integer.parseInt(args[2]) : 4;
+        int semaphoreLimit = args.length > 3 ? Integer.parseInt(args[3]) : 4;
+        boolean globalLock = args.length > 4 && args[4].equals("global");
+
+        List<Path> files;
+        try (var paths = Files.list(directory)) {
+            files = paths.sorted().toList();
+        }
+
+        // Последовательно
+        long t0 = System.nanoTime();
+        Report sequential = sequential(files, globalLock);
+        long t1 = System.nanoTime();
+
+        // Новый потокобезопасный container
+        Statistics stats = new Statistics(globalLock);
+        ExecutorService executor = Executors.newFixedThreadPool(workers);
+        Semaphore semaphore = new Semaphore(semaphoreLimit);
+        CountDownLatch latch = new CountDownLatch(files.size());
+        for (Path file : files) {
+            executor.submit(() -> processFile(file, stats, semaphore, latch));
+        }
+        latch.await();
+        executor.shutdown();
+        executor.awaitTermination(60, TimeUnit.SECONDS);
+
+        Report parallel = stats.buildReport();
+        long t2 = System.nanoTime();
+
+        System.out.println("sequential: " + sequential + " (" + (t1 - t0) / 1_000_000 + " ms)");
+        System.out.println("parallel:   " + parallel + " (" + (t2 - t1) / 1_000_000 + " ms)");
+        System.out.println("match: " + reportsEqual(sequential, parallel));
+        System.out.println("files=" + stats.filesProcessed.get()
+                + " lines=" + stats.linesRead.get()
+                + " valid=" + stats.validRecords.get()
+                + " corrupted=" + stats.corruptedRecords.get()
+                + " readErrors=" + stats.readErrors.get()
+                + " activeFiles=" + stats.activeFiles.get()
+                + " maxActive=" + stats.maxActiveFiles.get());
+    }
+
+    private static boolean reportsEqual(Report a, Report b) {
+        return a.totalRequests() == b.totalRequests()
+                && a.successfulRequests() == b.successfulRequests()
+                && a.errorRequests() == b.errorRequests()
+                && a.responseBytes() == b.responseBytes()
+                && a.maxDurationMillis() == b.maxDurationMillis();
+    }
+
+    private static Report sequential(List<Path> files, boolean globalLock) {
+        Statistics stats = new Statistics(globalLock);
+        for (Path file : files) {
+            processFile(file, stats, new Semaphore(Integer.MAX_VALUE), new CountDownLatch(1));
+        }
+        return stats.buildReport();
+    }
+
+    private static void processFile(Path file, Statistics stats, Semaphore semaphore, CountDownLatch latch) {
+        try {
+            if (stats.stopped()) return;
+            semaphore.acquire();
+            if (stats.stopped()) { semaphore.release(); return; }
+            stats.acquireActive();
+            try {
+                Iterator<String> it = LogFileLines.iterator(file);
+                while (it.hasNext() && !stats.stopped()) {
+                    stats.lineRead();
+                    try {
+                        stats.merge(parseLine(it.next()));
+                    } catch (IllegalArgumentException ignored) {
+                        stats.corrupted();
+                    }
+                }
+            } finally {
+                stats.releaseActive();
+                semaphore.release();
+            }
+            stats.fileDone();
+        } catch (Throwable ignored) {
+            stats.fileError();
+        } finally {
+            latch.countDown();
+        }
+    }
+
+    private static LogEntry parseLine(String line) {
+        String[] fields = line.trim().split("\\s+");
+        if (fields.length != 5) throw new IllegalArgumentException("bad fields: " + line);
+        try {
+            return new LogEntry(
+                    fields[0], fields[1],
+                    Integer.parseInt(fields[2]),
+                    Long.parseLong(fields[3]),
+                    Long.parseLong(fields[4])
+            );
+        } catch (NumberFormatException exception) {
+            throw new IllegalArgumentException("bad numbers: " + line, exception);
+        }
     }
 }
+
+/*
+ * ИНВАРИАНТЫ, КОТОРЫЕ НУЖНО ДОКАЗАТЬ:
+ * 1. каждая строка полного запуска обработана ровно один раз;
+ * 2. для каждого URL requests = successful + errors;
+ * 3. maxDuration <= totalDuration при наличии запросов;
+ * 4. 0 <= activeFiles <= semaphoreLimit;
+ * 5. после завершения анализа activeFiles равно нулю;
+ * 6. один повреждённый файл не мешает обработке остальных;
+ * 7. в программе нет дедлока.
+ *
+ * ну окей
+ *
+ * 1. 1 файл - 1 executor service
+ *
+ * 2. читайте код
+ * stats.requests++;
+ * if (entry.status() >= 200 && entry.status() <= 399) stats.successful++;
+ * else stats.errors++;
+ *
+ * 3. maxDuration <= totalDuration
+ * maxDuration - максимум по ОДНОМУ ЗАПРОСУ
+ * totalDuration - сумма по всем, сумма не может быть меньше
+ *
+ * 4. semaphore.acquire() гарантирует нам это, мы используем семафор
+ *
+ * 5. stats.releaseActive(); в finally выполняется всегда
+ * Так же уменьшается CountDownLatch
+ *
+ * 6. } catch (Throwable ignored) {
+            stats.fileError();
+ *
+ * 7. Дедлока нет
+ * Порядок - semaphore.acquire()
+ * activeFiles++
+ * чтение файла
+ * synchronized(UrlStats)
+ * semaphore.release()
+ * activeFiles--
+ *
+ * volatile stopped прерывает чтение автоматически
+ * CountDownLatch не блокирует выполнение внутри обработки файла
+ *
+ * Почему разрешение семафора возвращается при исключении?
+ * В finally, чтобы файл, упавший с ошибкой, не оставил разрешение
+ * «висящим» и не сократил реальную параллельность насовсем.
+ *
+ * Почему volatile для флага остановки?
+ * Чтобы запись stop() из одного потока была немедленно видна всем
+ * рабочим потокам в while (!stats.stopped()) без дополнительных блокировок.
+ *
+ * В контексте программы поток не может ждать acquire внутри synchronized блока
+ *
+
+ */
